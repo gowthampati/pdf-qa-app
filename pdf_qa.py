@@ -1,184 +1,121 @@
 import streamlit as st
-import PyPDF2
-import openai
+try:
+    import PyPDF2
+except ImportError:
+    st.error("Install PyPDF2: pip install PyPDF2")
+    st.stop()
+
 from openai import OpenAI
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
-import tiktoken
-import re
 
-# Page config
-st.set_page_config(page_title="PDF Q&A", page_icon="📄", layout="wide")
+st.set_page_config(page_title="PDF Q&A", layout="wide")
 
-# Sidebar for API key
-st.sidebar.title("Configuration")
-openai_api_key = st.sidebar.text_input("OpenAI API Key", type="password", help="Enter your OpenAI API key")
-if not openai_api_key:
-    st.sidebar.warning("Please add your OpenAI API key to continue.")
+st.title("📄 PDF Question Answering")
+st.markdown("*Upload PDF → Ask questions → Get GPT answers!*")
+
+# API Key (Secret management)
+api_key = st.sidebar.text_input("🔑 OpenAI API Key", type="password")
+if not api_key:
+    st.info("👈 **Get free key:** [platform.openai.com/api-keys](https://platform.openai.com/api-keys)")
     st.stop()
 
-client = OpenAI(api_key=openai_api_key)
-
-# Initialize session state
-if "documents" not in st.session_state:
-    st.session_state.documents = []
-if "embeddings" not in st.session_state:
-    st.session_state.embeddings = []
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-
-# Custom functions
 @st.cache_data
-def extract_text_from_pdf(pdf_file):
-    """Extract text from PDF file"""
-    text = ""
-    pdf_reader = PyPDF2.PdfReader(pdf_file)
-    for page in pdf_reader.pages:
-        text += page.extract_text() + "\n"
-    return text
+def extract_text(pdf_file):
+    reader = PyPDF2.PdfReader(pdf_file)
+    return "".join([page.extract_text() or "" for page in reader.pages])
 
-def split_text(text, chunk_size=1000, chunk_overlap=200):
-    """Split text into overlapping chunks"""
-    chunks = []
+def chunk_text(text, size=500):
     words = text.split()
-    for i in range(0, len(words), chunk_size - chunk_overlap):
-        chunk = " ".join(words[i:i + chunk_size])
-        chunks.append(chunk)
-    return chunks
+    return [" ".join(words[i:i+size]) for i in range(0, len(words), size//2)]
 
-def get_embedding(text, model="text-embedding-ada-002"):
-    """Get embedding from OpenAI"""
-    response = client.embeddings.create(
-        input=text,
-        model=model
-    )
-    return np.array(response.data[0].embedding)
+# File upload
+uploaded_file = st.file_uploader("📁 **Upload PDF**", type="pdf")
 
-def cosine_similarity_search(query_embedding, document_embeddings, documents, top_k=3):
-    """Find most similar documents using cosine similarity"""
-    similarities = cosine_similarity([query_embedding], document_embeddings)[0]
-    top_indices = np.argsort(similarities)[::-1][:top_k]
-    return [documents[i] for i in top_indices], similarities[top_indices]
+if uploaded_file:
+    with st.spinner("🔄 Extracting text..."):
+        text = extract_text(uploaded_file)
+        if not text.strip():
+            st.error("❌ No text found in PDF!")
+            st.stop()
+        
+        chunks = chunk_text(text)
+        st.session_state.chunks = chunks
+        st.success(f"✅ **{len(chunks)} chunks** extracted")
+        
+        st.caption("**Preview:** " + text[:200] + "...")
 
-def get_gpt_response(question, context, model="gpt-3.5-turbo"):
-    """Generate answer using GPT with context"""
-    prompt = f"""Use the following context to answer the question. If the answer is not in the context, say "I don't know".
+# Embeddings
+client = OpenAI(api_key=api_key)
+if "chunks" in st.session_state and "embeddings" not in st.session_state:
+    with st.spinner("🧠 Creating embeddings..."):
+        try:
+            st.session_state.embeddings = np.array([
+                client.embeddings.create(
+                    input=chunk[:8192],  # Token limit
+                    model="text-embedding-3-small"
+                ).data[0].embedding
+                for chunk in st.session_state.chunks
+            ])
+            st.success("✅ **Embeddings ready!** Ask away 👇")
+        except Exception as e:
+            st.error(f"❌ OpenAI Error: {str(e)[:100]}")
+            st.info("💡 Check API key & quota")
 
-Context:
+# Question Answering
+if "embeddings" in st.session_state:
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        question = st.text_input("💬 **Ask about the PDF:**")
+    
+    with col2:
+        if st.button("🗑️ **Clear**"):
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
+            st.rerun()
+    
+    if question:
+        with st.spinner("🔍 Searching... 🤖 Answering..."):
+            # Similarity search
+            q_embedding = np.array([client.embeddings.create(
+                input=question, model="text-embedding-3-small"
+            ).data[0].embedding])
+            
+            similarities = cosine_similarity(q_embedding, st.session_state.embeddings)[0]
+            top_indices = np.argsort(similarities)[-3:][::-1]
+            
+            context = "\n\n".join([st.session_state.chunks[i] for i in top_indices])
+            
+            # GPT Answer
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{
+                    "role": "user",
+                    "content": f"""Answer using ONLY this context. 
+If not found, say "I don't know".
+
+CONTEXT:
 {context}
 
-Question: {question}
+QUESTION: {question}
 
-Answer:"""
-    
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,
-        max_tokens=500
-    )
-    return response.choices[0].message.content.strip()
-
-# Main app
-st.title("📄 PDF Question Answering")
-st.markdown("Upload a PDF and ask questions about its content!")
-
-# File uploader
-uploaded_file = st.file_uploader("Choose a PDF file", type="pdf")
-
-if uploaded_file is not None:
-    # Process PDF
-    with st.spinner("Processing PDF..."):
-        text = extract_text_from_pdf(uploaded_file)
-        chunks = split_text(text)
-        
-        # Create embeddings
-        st.session_state.documents = chunks
-        st.session_state.embeddings = []
-        progress_bar = st.progress(0)
-        
-        for i, chunk in enumerate(chunks):
-            embedding = get_embedding(chunk)
-            st.session_state.embeddings.append(embedding)
-            progress_bar.progress((i + 1) / len(chunks))
-        
-        st.session_state.embeddings = np.array(st.session_state.embeddings)
-        st.success(f"✅ PDF processed! Created {len(chunks)} chunks with embeddings.")
-        
-        st.info(f"Document preview (first 500 chars):")
-        st.text(text[:500] + "..." if len(text) > 500 else text)
-
-# Chat interface
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    st.subheader("💬 Ask a question")
-    question = st.text_input("Enter your question:", key="question_input")
-
-with col2:
-    if st.button("Clear Chat", type="secondary"):
-        st.session_state.chat_history = []
-        st.rerun()
-
-if question and len(st.session_state.documents) > 0:
-    with st.spinner("Searching and generating answer..."):
-        # Get query embedding
-        query_embedding = get_embedding(question)
-        
-        # Find relevant chunks
-        relevant_chunks, scores = cosine_similarity_search(
-            query_embedding, 
-            st.session_state.embeddings, 
-            st.session_state.documents
-        )
-        
-        context = "\n\n".join(relevant_chunks)
-        
-        # Generate answer
-        answer = get_gpt_response(question, context)
-        
-        # Store in chat history
-        st.session_state.chat_history.append({
-            "question": question,
-            "answer": answer,
-            "context": context[:1000] + "..." if len(context) > 1000 else context,
-            "scores": scores
-        })
-        
-        question = ""  # Clear input
-
-# Display chat history
-if st.session_state.chat_history:
-    st.subheader("📚 Chat History")
-    
-    for i, chat in enumerate(st.session_state.chat_history[-10:], 1):  # Show last 10
-        with st.expander(f"Q: {chat['question'][:100]}..."):
-            st.markdown(f"**Answer:** {chat['answer']}")
+ANSWER:"""
+                }],
+                temperature=0.1,
+                max_tokens=300
+            )
             
-            with st.expander("📋 Context & Scores"):
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.text_area("Context", chat['context'], height=150, disabled=True)
-                with col2:
-                    st.metric("Similarity Scores", f"{chat['scores'][0]:.3f}, {chat['scores'][1]:.3f}, {chat['scores'][2]:.3f}")
+            answer = response.choices[0].message.content.strip()
+            
+            # Results
+            st.markdown("---")
+            st.markdown(f"### ❓ **{question}**")
+            st.markdown(f"### 🤖 **{answer}**")
+            
+            with st.expander("📊 **Context & Scores**"):
+                for i, idx in enumerate(top_indices):
+                    st.caption(f"**{i+1}.** {similarities[idx]:.1%} | {st.session_state.chunks[idx][:200]}...")
 
-# Instructions
-with st.expander("ℹ️ How to use"):
-    st.markdown("""
-    1. **Add your OpenAI API key** in the sidebar
-    2. **Upload a PDF** file
-    3. **Wait for processing** (creates embeddings)
-    4. **Ask questions** about the PDF content
-    5. **View answers** with relevant context
-    
-    **Features:**
-    - Semantic search using embeddings
-    - Cosine similarity ranking
-    - GPT-powered answers with context
-    - "I don't know" if answer not found
-    - Chat history with context preview
-    """)
-
-# Footer
 st.markdown("---")
-st.markdown("Built with ❤️ using Streamlit + OpenAI")
+st.markdown("*Made with ❤️ using Streamlit + OpenAI*")
