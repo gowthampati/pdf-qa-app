@@ -1,8 +1,1 @@
-graph TD
-    A[PDF Upload] --> B[Extract Text<br/>PyPDF2]
-    B --> C[Split Chunks<br/>400 words each]
-    C --> D[OpenAI Embeddings<br/>1536D vectors]
-    E[Your Question] --> F[Q Embedding]
-    F --> G[Cosine Similarity<br/>Top 3 matches]
-    G --> H[GPT-4o-mini Answer]
-    H --> I[✅ Final Answer]
+<div align="center"> <img src="https://img.shields.io/github/stars/YOUR_USERNAME/pdf-qa-app?style=social" alt="Stars"> <img src="https://img.shields.io/github/forks/YOUR_USERNAME/pdf-qa-app?style=social" alt="Forks"> </div>
